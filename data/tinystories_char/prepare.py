@@ -8,7 +8,9 @@ encoder and decoder and some other related info.
 import os
 import numpy as np
 import pickle
+
 from datasets import load_dataset # huggingface datasets
+from tqdm import tqdm
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
@@ -39,7 +41,8 @@ chars_dataset = set([])
 len_dataset = 0
 
 # get all the unique characters that occur in this text as well as total length for training data
-for story in dataset['train']['text']:
+desc = "Enumerate characters in training set"
+for story in tqdm(dataset['train']['text'], desc):
     chars = list(set(story))
 
     for char in chars:
@@ -48,7 +51,8 @@ for story in dataset['train']['text']:
     len_dataset += len(story)
 
 # get all the unique characters that occur in this text as well as total length for validation data
-for story in dataset['validation']['text']:
+desc = "Enumerate characters in validation set"
+for story in tqdm(dataset['validation']['text'], desc):
     chars = list(set(story))
 
     for char in chars:
@@ -75,7 +79,8 @@ def decode(l):
 
 # iterate over dataset stories, encode story, add it to the correct split
 train_ids = np.array([], dtype=np.uint16)
-for idx, story in enumerate(dataset['train']['text']): 
+desc = "Encode Training Set"
+for story in tqdm(dataset['train']['text'], desc): 
     # determin if this is in the val or train set
     story_array = np.array(encode(story), dtype=np.uint16)
     train_ids = np.concatenate((train_ids, story_array))
@@ -84,7 +89,8 @@ print(f"train has {len(train_ids):,} tokens")
 train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
  
 val_ids = np.array([], dtype=np.uint16)
-for idx, story in enumerate(dataset['validation']['text']): 
+desc = "Encode validation set"
+for story in tqdm(dataset['validation']['text'], desc): 
     # determin if this is in the val or train set
     story_array = np.array(encode(story), dtype=np.uint16)
     val_ids_ids = np.concatenate((val_ids, story_array))
