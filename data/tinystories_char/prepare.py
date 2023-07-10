@@ -8,12 +8,9 @@ encoder and decoder and some other related info.
 import os
 import numpy as np
 import pickle
-import ray
 
 from datasets import load_dataset # huggingface datasets
 from tqdm import tqdm
-
-ray.init()
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
@@ -26,6 +23,17 @@ num_proc_load_dataset = num_proc
 
 # takes 17GB in huggingface .cache dir, about 30.7M documents (30,720,769)
 dataset = load_dataset("roneneldan/TinyStories", num_proc=num_proc_load_dataset)
+
+def clean(record):
+    # only ascii chars
+    record['text'] = record['text'].encode('ascii', 'ignore')
+    return  record
+
+cleaned_dataset = dataset.map(
+    clean,
+    desc="cleaning input",
+    num_proc=num_proc
+)
 
 # this results in:
 # >>> dataset
@@ -41,32 +49,22 @@ dataset = load_dataset("roneneldan/TinyStories", num_proc=num_proc_load_dataset)
 #})
 
 chars_dataset = set([])
-len_dataset = 0
 
 # get all the unique characters that occur in this text as well as total length for training data
 desc = "Enumerate characters in training set"
-for story in tqdm(dataset['train']['text'], desc):
-    chars = list(set(story))
-
-    for char in chars:
+for record in tqdm(cleaned_dataset['train'], desc):
+    for char in record['text']:
         chars_dataset.add(char)
-    
-    len_dataset += len(story)
 
 # get all the unique characters that occur in this text as well as total length for validation data
 desc = "Enumerate characters in validation set"
-for story in tqdm(dataset['validation']['text'], desc):
-    chars = list(set(story))
-
-    for char in chars:
+for record in tqdm(cleaned_dataset['validation'], desc):
+    for char in record['text']:
         chars_dataset.add(char)
     
-    len_dataset += len(story)
-
 sorted_chars_dataset = sorted(list(chars_dataset))
 vocab_size = len(sorted_chars_dataset)
 
-print(f"length of dataset in characters: {len_dataset:,}")
 print("all the unique characters:", ''.join(sorted_chars_dataset))
 print(f"vocab size: {vocab_size:,}")
 
@@ -79,49 +77,6 @@ def encode(s):
 def decode(l):
     return ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
 
-@ray.remote
-def async_concat(a, b):
-    if isinstance(a, str):
-        a = np.array(encode(a), dtype=np.uint16)
-    if isinstance(b, str):
-        b = np.array(encode(b), dtype=np.uint16)
-    return np.concatenate((a, b))
-
-# create the train and test splits based on stories for convenience
-
-# iterate over dataset stories, encode story, add it to the correct split
-desc = "Encode Training Set"
-train_ids = np.array([], dtype=np.uint16)
-chunk_size = 50000
-num_chunks = len(dataset['train']['text']) // chunk_size
-for i in range(num_chunks):
-    print(f"{desc}: Chunk {i}/{num_chunks} ({i/num_chunks:.2%})", end="\r")
-    start_idx = i * chunk_size
-    end_idx = start_idx + chunk_size
-
-    if end_idx > len(dataset['train']['text']):
-        chunk = dataset['train']['text'][start_idx:]
-    else:
-        chunk = dataset['train']['text'][start_idx:end_idx]
-
-    while len(chunk) > 1:
-        chunk = chunk[2:] + [async_concat.remote(chunk[0], chunk[1])]
-    curr_train_ids = ray.get(chunk[0])
-    train_ids = np.concatenate((train_ids, curr_train_ids))
-
-print(f"train has {len(train_ids):,} tokens")
-train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
- 
-val_encoded = []
-for story in tqdm(dataset['validation']['text'], desc): 
-    # determin if this is in the val or val set
-    val_encoded.append(encode.remote(story))
-val_ids = np.array(ray.get(val_encoded), dtype=np.uint16)
-
-print(f"val has {len(val_ids):,} tokens")
-val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
-# export to bin files
-
 # save the meta information as well, to help us encode/decode later
 meta = {
     'vocab_size': vocab_size,
@@ -131,6 +86,35 @@ meta = {
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
-# length of dataset in characters: 4,160,818,075
-# all the unique characters:       !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£§«­°´·»¿ÂÉßàáâåèéêíïñóöúāİœɪʏʙʜіғᴀᴄᴅᴇᴏᴛᴜᴡᴢ   ​‌‎‐‑‒–—―‘’‚“”„…‪′€™−─❤　。」一了些他但保個們兒兩分到剛又和在天奮她己巴度很恩應把整是時會獨玉田留當的童答米給自興艾莉裡這過難高ﬁﬂ﻿，￼�𝑐🌴🌹🍌🍞🎓💖🙂🤩
-# vocab size: 242
+def process(record):
+    record['tokens'] = encode(f"{record['text']} ")
+    record['len'] = len(record['tokens'])
+    return record
+
+tokenized = cleaned_dataset.map(
+    process,
+    desc="tokenizing the splits",
+    num_proc=num_proc
+)
+
+# concatenate all the ids in each dataset into one large file we can use for training
+len_dataset = 0
+for split, dset in tokenized.items():
+    arr_len = np.sum(dset['len'], dtype=np.uint64)
+    len_dataset += arr_len
+    filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+    dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
+    arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
+    total_batches = 1024
+
+    idx = 0
+    for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
+        # Batch together samples for faster write
+        batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
+        arr_batch = np.concatenate(batch['tokens'])
+        # Write into mmap
+        arr[idx : idx + len(arr_batch)] = arr_batch
+        idx += len(arr_batch)
+    arr.flush()
+
+print(f"length of dataset in characters: {len_dataset:,}")
